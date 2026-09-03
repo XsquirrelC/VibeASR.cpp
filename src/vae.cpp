@@ -92,6 +92,67 @@ static struct ggml_tensor* ggml_nn_linear_relu(
     return result;
 }
 
+// Channel-major 1D convolution: result is [OC, OL*N] with OC contiguous.
+//
+// The whole VAE graph works in channel-major layout, so that the bias add
+// broadcasts on ne[0] and the F32 fallback shares its shape with the I8_S
+// path below. ggml_conv_1d instead returns length-major [OL, OC, N], so the
+// two-line body is kept here rather than changing ggml_conv_1d itself, whose
+// layout other models depend on.
+static struct ggml_tensor* ggml_nn_conv_1d_cm(
+    struct ggml_context* ctx,
+    struct ggml_tensor* w,
+    struct ggml_tensor* x,
+    int stride,
+    int padding,
+    int dilation) {
+
+    struct ggml_tensor* im2col = ggml_im2col(ctx, w, x, stride, 0, padding, 0,
+                                             dilation, 0, false, GGML_TYPE_F32);
+
+    return ggml_mul_mat(ctx,
+            ggml_reshape_2d(ctx, w, (w->ne[0] * w->ne[1]), w->ne[2]),
+            ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])));
+}
+
+// Channel-major depthwise 1D convolution: result is [C, OL, N].
+//
+// Deliberately not named ggml_conv_1d_dw: upstream ggml has a function by that
+// name returning length-major [OL, C, N], and having both semantics under one
+// name is how the layout regression happened in the first place.
+static struct ggml_tensor* ggml_nn_conv_1d_dw_cm(
+    struct ggml_context* ctx,
+    struct ggml_tensor* w,
+    struct ggml_tensor* x,
+    int stride,
+    int padding,
+    int dilation) {
+
+    GGML_ASSERT(w->ne[2] == x->ne[1]);
+
+    const int64_t C = w->ne[2];
+    const int64_t L = x->ne[0];
+    const int64_t N = x->ne[2];
+
+    struct ggml_tensor* x4d = ggml_reshape_4d(ctx, x, L, 1, C, N);
+
+    struct ggml_tensor* im2col = ggml_im2col(ctx, w, x4d, stride, 0, padding, 0,
+                                             dilation, 0, false, GGML_TYPE_F32);
+
+    struct ggml_tensor* im2d = ggml_reshape_3d(ctx, im2col,
+            im2col->ne[0], im2col->ne[1] * im2col->ne[3], im2col->ne[2]);
+
+    struct ggml_tensor* w3d = ggml_reshape_3d(ctx, w, w->ne[0], 1, C);
+
+    struct ggml_tensor* result = ggml_mul_mat(ctx, w3d, im2d);
+
+    const int64_t OL = im2col->ne[1];
+
+    result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 2, 1, 3));
+
+    return ggml_reshape_3d(ctx, result, C, OL, N);
+}
+
 static struct ggml_tensor* ggml_nn_conv_1d(
     struct ggml_context* ctx,
     struct ggml_tensor* x,
@@ -117,7 +178,7 @@ static struct ggml_tensor* ggml_nn_conv_1d(
             x = ggml_pad_ext(ctx, x, padding, 0, 0, 0, 0, 0, 0, 0);
             padding = 0;
         }
-        result = ggml_conv_1d(ctx, w, x, stride, padding, dilation);
+        result = ggml_nn_conv_1d_cm(ctx, w, x, stride, padding, dilation);
         if (b != NULL) {
             result = ggml_add(ctx, result, b);
         }
@@ -149,7 +210,7 @@ static struct ggml_tensor* ggml_nn_conv_1d_dw(
             x = ggml_pad_ext(ctx, x, padding, 0, 0, 0, 0, 0, 0, 0);
             padding = 0;
         }
-        result = ggml_conv_1d_dw(ctx, w, x, stride, padding, dilation);
+        result = ggml_nn_conv_1d_dw_cm(ctx, w, x, stride, padding, dilation);
         if (b != NULL) {
             result = ggml_add(ctx, result, b);
         }
@@ -651,17 +712,21 @@ static int32_t vae_encode_impl(
 
     // Create computation context with sufficient memory.
     // Arena use is linear in the input length, and depends on the weight type:
-    // F32 models need more memory than I8_S due to 4x larger intermediate
-    // tensors. The I8_S rate is measured at ~8.9 KB per input sample (~214 MB
-    // per second of 24 kHz audio), constant across 8 s to 267 s inputs; the F32
-    // rate applies the 4x ratio above.
+    // F32 models need more memory than I8_S because the intermediates are wider.
+    // Both rates are measured with ggml_used_mem() after graph construction and
+    // are constant in the input length: I8_S ~8.9 KB per input sample (~214 MB
+    // per second of 24 kHz audio), F32 ~53.4 KB per sample (54636 B at 48000
+    // samples, 54612 B at 264000). Note the F32/I8_S ratio is ~5.3x, not the 4x
+    // a plain sizeof(float)/sizeof(int8_t) argument suggests -- the I8_S graph
+    // also skips intermediates the F32 fallback materializes -- so the F32 rate
+    // has to be measured rather than derived.
     // A fixed reservation is wrong in both directions. 128 GB is refused
     // outright by Windows (no overcommit) and by Linux heuristic overcommit on
     // any host whose RAM + swap is smaller, aborting in ggml_aligned_malloc
     // before any audio is processed. A small fixed pool starts everywhere but
     // silently caps input length and then segfaults past it. Size the arena
     // from the actual sample count instead, with ~15% headroom.
-    const size_t bytes_per_sample = use_i8_s ? 10240 : 40960;
+    const size_t bytes_per_sample = use_i8_s ? 10240 : 63488;
     const size_t vae_ctx_mem_size =
         (size_t)n_samples * bytes_per_sample + (size_t)512 * 1024 * 1024;
     struct ggml_init_params ctx_params = {
