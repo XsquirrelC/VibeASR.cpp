@@ -166,6 +166,95 @@ static struct ggml_tensor* ggml_nn_layer_scale(
 }
 
 //
+// Streaming (chunk-by-chunk) encoder state
+//
+// Every conv in this encoder pads left-only, so the encoder is causal and a
+// chunk can be encoded from a bounded amount of history. The history is not
+// small though: the kernels compose to a 67.6-latent-frame receptive field, so
+// re-encoding the overlap for each 22-frame chunk would cost (68+22)/22 = 4.1x
+// the frames and blow the real-time budget. Caching each conv's own left
+// context instead makes a chunk cost exactly its own frames, at 737 KiB per
+// encoder.
+//
+// A slot holds the last n_ctx time steps of one conv's input, as f32, laid out
+// [n_ctx, dim] - the same time-major layout the conv sees. n_ctx is the causal
+// pad that slot replaces: kernel - stride for the strided downsamples,
+// kernel - 1 for the depthwise mixers and the head conv.
+
+struct vae_stream_slot {
+    int    n_ctx;
+    int    dim;
+    size_t offset;  // into vae_stream_enc::buf, in floats
+};
+
+struct vae_stream_enc {
+    std::vector<vae_stream_slot> slots;
+    std::vector<float>           buf;
+    size_t                       n_floats = 0;
+
+    // Per-graph scratch, valid only between one build and its compute.
+    int cursor = 0;
+    std::vector<struct ggml_tensor*> cache_in;
+    std::vector<struct ggml_tensor*> cache_out;
+
+    void begin_graph() {
+        cursor = 0;
+        cache_in.clear();
+        cache_out.clear();
+    }
+};
+
+// Replace a conv's causal left pad with that conv's cached left context.
+// Returns the extended input, and records the tail that becomes the next
+// chunk's cache. x must be contiguous and time-major: [L, C].
+//
+// Output alignment is exact as long as the stride divides L, which holds for
+// every stage whenever the chunk is a whole number of latent frames: with
+// n_ctx = kernel - stride prepended and no padding, the conv emits
+// (n_ctx + L - kernel)/stride + 1 = L/stride outputs, at the same positions
+// batch mode would produce.
+static struct ggml_tensor* vae_stream_pad(
+    struct ggml_context* ctx,
+    vae_stream_enc* st,
+    struct ggml_tensor* x,
+    int n_ctx) {
+
+    const int64_t L = x->ne[0];
+    const int64_t C = x->ne[1];
+
+    const int idx = st->cursor++;
+    if ((int) st->slots.size() == idx) {
+        // The first graph fixes the geometry; later graphs must agree, or the
+        // slots would be read back into the wrong offsets.
+        st->slots.push_back({ n_ctx, (int) C, st->n_floats });
+        st->n_floats += (size_t) n_ctx * C;
+    } else {
+        GGML_ASSERT(st->slots[idx].n_ctx == n_ctx);
+        GGML_ASSERT(st->slots[idx].dim   == (int) C);
+    }
+    const vae_stream_slot& slot = st->slots[idx];
+
+    struct ggml_tensor* cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ctx, C);
+    const size_t n = (size_t) n_ctx * C;
+    if (st->buf.size() >= slot.offset + n) {
+        memcpy(cache->data, st->buf.data() + slot.offset, n * sizeof(float));
+    } else {
+        // First chunk: zero history, which is exactly the zero pad batch mode
+        // would have inserted.
+        memset(cache->data, 0, n * sizeof(float));
+    }
+    st->cache_in.push_back(cache);
+
+    struct ggml_tensor* ext = ggml_concat(ctx, cache, x, /*dim =*/ 0);
+
+    // cont so the tail is contiguous and can be memcpy'd straight back out.
+    st->cache_out.push_back(ggml_cont(ctx,
+        ggml_view_2d(ctx, ext, n_ctx, C, ext->nb[1], (size_t) L * ext->nb[0])));
+
+    return ext;
+}
+
+//
 // ConvNeXt Block
 //
 
@@ -189,7 +278,8 @@ struct ConvNeXtBlock {
     
     struct ggml_tensor* forward(
         struct ggml_context* ctx,
-        struct ggml_tensor* x) {
+        struct ggml_tensor* x,
+        vae_stream_enc* st = nullptr) {
 
         struct ggml_tensor* residual = x;
         bool is_i8s = (x->type == GGML_TYPE_I8_S);
@@ -198,8 +288,14 @@ struct ConvNeXtBlock {
 
         x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
 
-        x = ggml_nn_conv_1d_dw(ctx, x, mixer_conv_weight, mixer_conv_bias,
-                                /*stride=*/1, /*padding=*/kernel_size-1, /*dilation=*/1);
+        if (st) {
+            x = vae_stream_pad(ctx, st, x, kernel_size-1);
+            x = ggml_nn_conv_1d_dw(ctx, x, mixer_conv_weight, mixer_conv_bias,
+                                    /*stride=*/1, /*padding=*/0, /*dilation=*/1);
+        } else {
+            x = ggml_nn_conv_1d_dw(ctx, x, mixer_conv_weight, mixer_conv_bias,
+                                    /*stride=*/1, /*padding=*/kernel_size-1, /*dilation=*/1);
+        }
 
         if (is_i8s) {
             x = ggml_add_scaled(ctx, x, residual, mixer_layer_scale);
@@ -274,26 +370,40 @@ struct AudioVAEEncoder {
     
     struct ggml_tensor* forward(
         struct ggml_context* ctx,
-        struct ggml_tensor* x) {
-        
+        struct ggml_tensor* x,
+        vae_stream_enc* st = nullptr) {
+
         // Downsamples and stages
         for (int i = 0; i < n_stages; i++) {
 
-            x = ggml_nn_conv_1d(ctx, x, downsamples[i].conv_weight,
-                                 downsamples[i].conv_bias,
-                                 downsample_strides[i], downsample_kernel_sizes[i]-downsample_strides[i], 1);
-            
+            const int pad = downsample_kernel_sizes[i] - downsample_strides[i];
+            if (st) {
+                x = vae_stream_pad(ctx, st, x, pad);
+                x = ggml_nn_conv_1d(ctx, x, downsamples[i].conv_weight,
+                                     downsamples[i].conv_bias,
+                                     downsample_strides[i], 0, 1);
+            } else {
+                x = ggml_nn_conv_1d(ctx, x, downsamples[i].conv_weight,
+                                     downsamples[i].conv_bias,
+                                     downsample_strides[i], pad, 1);
+            }
+
             for (int j = 0; j < stage_depths[i]; j++) {
-                x = stages[i][j].forward(ctx, x);
+                x = stages[i][j].forward(ctx, x, st);
             }
 
             x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
 
         }
-        
+
         // Head
-        x = ggml_nn_conv_1d(ctx, x, head_conv_weight, head_conv_bias, 1, 8-1, 1);
-        
+        if (st) {
+            x = vae_stream_pad(ctx, st, x, 8-1);
+            x = ggml_nn_conv_1d(ctx, x, head_conv_weight, head_conv_bias, 1, 0, 1);
+        } else {
+            x = ggml_nn_conv_1d(ctx, x, head_conv_weight, head_conv_bias, 1, 8-1, 1);
+        }
+
         // Connector: fc1 -> norm -> fc2
         x = ggml_nn_linear(ctx, x, connector_fc1_weight, connector_fc1_bias);
         x = ggml_nn_rms_norm(ctx, x, connector_norm_weight);
@@ -650,7 +760,11 @@ static int32_t vae_encode_impl(
     // before any audio is processed. A small fixed pool starts everywhere but
     // silently caps input length and then segfaults past it. Size the arena
     // from the actual sample count instead, with ~15% headroom.
-    const size_t bytes_per_sample = use_i8_s ? 10240 : 40960;
+    // The 4x-of-I8_S estimate for F32 (40960) is too low in practice - a
+    // 44-frame F32 encode runs past it and aborts in ggml_new_object. Measured
+    // with VAE_DEBUG_MEM=1 the F32 path actually uses 54621 B/sample, so 65536
+    // (6.4x the I8_S rate) restores the ~15-20% headroom.
+    const size_t bytes_per_sample = use_i8_s ? 10240 : 65536;
     const size_t vae_ctx_mem_size =
         (size_t)n_samples * bytes_per_sample + (size_t)512 * 1024 * 1024;
     struct ggml_init_params ctx_params = {
@@ -709,6 +823,13 @@ static int32_t vae_encode_impl(
     if (ggml_graph_compute_with_ctx(ctx->compute_ctx, gf, ctx->n_threads) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[VAE] Error: Graph computation failed\n");
         return -1;
+    }
+
+    if (getenv("VAE_DEBUG_MEM")) {
+        fprintf(stderr, "[VAE] batch arena: %.2f / %.2f GiB, %.0f B/sample used\n",
+                ggml_used_mem(ctx->compute_ctx) / 1073741824.0,
+                vae_ctx_mem_size / 1073741824.0,
+                (double) ggml_used_mem(ctx->compute_ctx) / n_samples);
     }
     
     // Get output dimensions
@@ -775,6 +896,196 @@ int32_t vae_encode_semantic_with_timing(
     int32_t n_samples,
     float* output,
     float* inference_time_ms) {
-    
+
     return vae_encode_impl(ctx, ctx->model->semantic_encoder, audio, n_samples, output, inference_time_ms);
+}
+
+//
+// Streaming encode
+//
+
+struct vae_stream {
+    vae_model_t* model = nullptr;
+    int n_threads = 4;
+
+    vae_stream_enc acoustic;
+    vae_stream_enc semantic;
+
+    int64_t n_samples_seen = 0;
+
+    struct ggml_context* compute_ctx = nullptr;
+
+    ~vae_stream() {
+        if (compute_ctx) {
+            ggml_free(compute_ctx);
+        }
+    }
+};
+
+static int32_t vae_stream_encode_one(
+    vae_stream_t* s,
+    AudioVAEEncoder& encoder,
+    vae_stream_enc& st,
+    const float* audio,
+    int32_t n_samples,
+    float* output,
+    float* inference_time_ms) {
+
+    struct timespec start_time, end_time;
+    if (inference_time_ms) {
+        clock_gettime(CLOCK_MONOTONIC, &start_time);
+    }
+
+    // The cache is stored as f32 and concatenated in f32. Doing the same on the
+    // I8_S path would need the concat to requantize, since the cached rows carry
+    // the previous chunk's activation scale while the new rows carry this one's
+    // (the scale is a per-tensor dynamic absmax). Until that op exists, refuse
+    // rather than emit wrong latents.
+    if (encoder.downsamples[0].conv_weight->type == GGML_TYPE_I8_S) {
+        fprintf(stderr, "[VAE] Error: streaming encode is F32-only for now; "
+                        "the I8_S path needs a requantizing concat\n");
+        return -1;
+    }
+
+    const size_t bytes_per_sample = 65536;
+    const size_t mem_size =
+        (size_t) n_samples * bytes_per_sample + (size_t) 512 * 1024 * 1024;
+    struct ggml_init_params ctx_params = {
+        /*.mem_size   =*/ mem_size,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+
+    if (s->compute_ctx) {
+        ggml_free(s->compute_ctx);
+    }
+    s->compute_ctx = ggml_init(ctx_params);
+
+    struct ggml_tensor* input = ggml_new_tensor_3d(s->compute_ctx, GGML_TYPE_F32, n_samples, 1, 1);
+    ggml_set_name(input, "input_audio");
+    memcpy(input->data, audio, (size_t) n_samples * sizeof(float));
+
+    st.begin_graph();
+    struct ggml_tensor* result = encoder.forward(s->compute_ctx, input, &st);
+
+    // First graph: the slot walk above discovered the geometry, so size the
+    // backing buffer now. It stays zero, which is the history the first chunk
+    // should see.
+    if (st.buf.empty()) {
+        st.buf.assign(st.n_floats, 0.0f);
+    }
+
+    size_t max_nodes = vae_model_max_nodes(s->model);
+    struct ggml_cgraph* gf = ggml_new_graph_custom(s->compute_ctx, max_nodes, false);
+    ggml_build_forward_expand(gf, result);
+    for (struct ggml_tensor* t : st.cache_out) {
+        ggml_build_forward_expand(gf, t);
+    }
+
+    if (ggml_graph_compute_with_ctx(s->compute_ctx, gf, s->n_threads) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "[VAE] Error: streaming graph computation failed\n");
+        return -1;
+    }
+
+    if (getenv("VAE_DEBUG_MEM")) {
+        fprintf(stderr, "[VAE] stream arena: %.2f / %.2f GiB, %.0f B/sample used\n",
+                ggml_used_mem(s->compute_ctx) / 1073741824.0,
+                mem_size / 1073741824.0,
+                (double) ggml_used_mem(s->compute_ctx) / n_samples);
+    }
+
+    const int64_t n_frames = result->ne[1];
+    const int64_t out_dim  = result->ne[0];
+    memcpy(output, result->data, (size_t) n_frames * out_dim * result->ne[2] * sizeof(float));
+
+    // Roll the caches forward for the next chunk.
+    GGML_ASSERT(st.cache_out.size() == st.slots.size());
+    for (size_t i = 0; i < st.slots.size(); i++) {
+        const vae_stream_slot& slot = st.slots[i];
+        memcpy(st.buf.data() + slot.offset, st.cache_out[i]->data,
+               (size_t) slot.n_ctx * slot.dim * sizeof(float));
+    }
+
+    if (inference_time_ms) {
+        clock_gettime(CLOCK_MONOTONIC, &end_time);
+        double elapsed = (end_time.tv_sec - start_time.tv_sec) * 1000.0 +
+                        (end_time.tv_nsec - start_time.tv_nsec) / 1e6;
+        *inference_time_ms = (float) elapsed;
+    }
+
+    return (int32_t) n_frames;
+}
+
+vae_stream_t* vae_stream_init(vae_model_t* model, struct vae_context_params params) {
+    if (!model) {
+        return nullptr;
+    }
+    auto s = new vae_stream();
+    s->model = model;
+    s->n_threads = params.n_threads;
+    return s;
+}
+
+void vae_stream_free(vae_stream_t* s) {
+    delete s;
+}
+
+void vae_stream_reset(vae_stream_t* s) {
+    if (!s) {
+        return;
+    }
+    std::fill(s->acoustic.buf.begin(), s->acoustic.buf.end(), 0.0f);
+    std::fill(s->semantic.buf.begin(), s->semantic.buf.end(), 0.0f);
+    s->n_samples_seen = 0;
+}
+
+size_t vae_stream_cache_bytes(const vae_stream_t* s) {
+    if (!s) {
+        return 0;
+    }
+    return (s->acoustic.buf.size() + s->semantic.buf.size()) * sizeof(float);
+}
+
+int32_t vae_stream_encode(
+    vae_stream_t* s,
+    const float* audio,
+    int32_t n_samples,
+    float* out_acoustic,
+    float* out_semantic,
+    float* inference_time_ms) {
+
+    if (!s || !audio || n_samples <= 0) {
+        return -1;
+    }
+    // Whole latent frames only. A partial frame would leave the deepest stage's
+    // stride unsatisfied and shift every later chunk's output positions.
+    if (n_samples % VAE_STREAM_COMPRESS_RATIO != 0) {
+        fprintf(stderr, "[VAE] Error: streaming chunk must be a multiple of %d samples, got %d\n",
+                VAE_STREAM_COMPRESS_RATIO, n_samples);
+        return -1;
+    }
+
+    float t_a = 0.0f, t_s = 0.0f;
+    int32_t n_a = -1, n_s = -1;
+
+    if (out_acoustic) {
+        n_a = vae_stream_encode_one(s, s->model->acoustic_encoder, s->acoustic,
+                                    audio, n_samples, out_acoustic, &t_a);
+        if (n_a < 0) return -1;
+    }
+    if (out_semantic) {
+        n_s = vae_stream_encode_one(s, s->model->semantic_encoder, s->semantic,
+                                    audio, n_samples, out_semantic, &t_s);
+        if (n_s < 0) return -1;
+    }
+    if (n_a >= 0 && n_s >= 0 && n_a != n_s) {
+        fprintf(stderr, "[VAE] Error: encoders disagree on frame count (%d vs %d)\n", n_a, n_s);
+        return -1;
+    }
+
+    s->n_samples_seen += n_samples;
+    if (inference_time_ms) {
+        *inference_time_ms = t_a + t_s;
+    }
+    return n_a >= 0 ? n_a : n_s;
 }

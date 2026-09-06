@@ -100,6 +100,61 @@ set_target_properties(asr_stream_server PROPERTIES
     OUTPUT_NAME asr_stream_server
 )
 
+
+# Add chunk-level latency benchmark for streaming development
+add_executable(bench_chunk
+    demo/bench_chunk.cpp
+    src/vae.cpp
+    src/vae.h
+)
+
+target_include_directories(bench_chunk PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/utils
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/llama.cpp/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/llama.cpp/ggml/include
+)
+
+target_link_libraries(bench_chunk PRIVATE
+    common
+    llama
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+target_compile_features(bench_chunk PRIVATE cxx_std_11)
+
+set_target_properties(bench_chunk PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Streaming-vs-batch equivalence check for the VAE encoder cache
+add_executable(test_stream_encode
+    demo/test_stream_encode.cpp
+    src/vae.cpp
+    src/vae.h
+)
+
+target_include_directories(test_stream_encode PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/utils
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/llama.cpp/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/llama.cpp/ggml/include
+)
+
+target_link_libraries(test_stream_encode PRIVATE
+    common
+    llama
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+target_compile_features(test_stream_encode PRIVATE cxx_std_11)
+
+set_target_properties(test_stream_encode PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 # install
 
 include(GNUInstallDirs)
