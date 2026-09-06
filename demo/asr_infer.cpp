@@ -276,7 +276,7 @@ int main(int argc, char ** argv) {
     }
 
     acoustic_features.resize(acoustic_frames * acoustic_dim);
-    fprintf(stderr, "  Acoustic: %d frames, dim=%d, time=%.1fms\n",
+    fprintf(stderr, "  Acoustic: %d frames, dim=%d, time=%.1fms\n\n",
             acoustic_frames, acoustic_dim, acoustic_time_ms);
 
     // ========================================
@@ -324,7 +324,7 @@ int main(int argc, char ** argv) {
         // ========================================
         // Step 7: LM Prefill (segmented: token ID + embedding + token ID)
         // ========================================
-        fprintf(stderr, "[Step 7] LM prefill (segmented)...\n");
+        fprintf(stderr, "\n[Step 7] LM prefill (segmented)...\n");
         t0 = get_time_ms();
 
         int n_prompt_tokens = (int)prompt.tokens.size();
@@ -418,7 +418,7 @@ int main(int argc, char ** argv) {
         // ========================================
         // Step 9: Detokenize and output
         // ========================================
-        fprintf(stderr, "[Step 9] Post-processing output...\n\n");
+        fprintf(stderr, "[Step 9] Post-processing output...\n");
 
         // Skip the assistant header tokens that the model generates itself
         // (since we don't include generation prompt, model generates <|im_start|>assistant\n first)
@@ -466,15 +466,21 @@ int main(int argc, char ** argv) {
         std::string output_text = prompt_builder::detokenize(lm_model, content_tokens, false);
 
         double total_time = get_time_ms() - total_start;
-        double rtf = (total_time / 1000.0) / audio.duration_sec;
+        // Model loading happens once at service startup, so it is not part of
+        // what a user waits for per request. RTF measures the per-request path
+        // only: audio in -> encode -> prefill -> decode.
+        double load_time    = vae_load_time + lm_load_time;
+        double request_time = total_time - load_time;
+        double rtf = (request_time / 1000.0) / audio.duration_sec;
 
         // Print timing summary
-        fprintf(stderr, "========================================\n");
+        fprintf(stderr, "\n========================================\n");
         fprintf(stderr, " Timing Summary\n");
         fprintf(stderr, "========================================\n");
-        fprintf(stderr, "  Audio loading:        %8.1f ms\n", audio_load_time);
         fprintf(stderr, "  VAE model loading:    %8.1f ms\n", vae_load_time);
         fprintf(stderr, "  LM model loading:     %8.1f ms\n", lm_load_time);
+        fprintf(stderr, "  ─────────────────────────────────────\n");
+        fprintf(stderr, "  Audio loading:        %8.1f ms\n", audio_load_time);
         fprintf(stderr, "  VAE acoustic encode:  %8.1f ms\n", (double)acoustic_time_ms);
         fprintf(stderr, "  VAE semantic encode:  %8.1f ms\n", (double)semantic_time_ms);
         fprintf(stderr, "  Prompt build:         %8.1f ms\n", prompt_build_time);
@@ -482,7 +488,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "  LM decode:            %8.1f ms (%d tokens, %.2f ms/tok)\n",
                 decode_time, n_decoded, per_token_ms);
         fprintf(stderr, "  ─────────────────────────────────────\n");
-        fprintf(stderr, "  Total inference:      %8.1f ms\n", total_time);
+        fprintf(stderr, "  Total:                %8.1f ms\n", request_time);
         fprintf(stderr, "  Audio duration:       %8.1f ms\n", audio.duration_sec * 1000.0);
         fprintf(stderr, "  RTF:                  %8.4f\n", rtf);
         fprintf(stderr, "========================================\n\n");

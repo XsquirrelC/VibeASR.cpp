@@ -9,14 +9,6 @@
 #include "vae-config.h"
 
 #if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__SSSE3__)
-#define QK_I8_S 32
-#elif defined(__ARM_NEON)
-#define QK_I8_S 8
-#else
-#define QK_I8_S 32
-#endif
-
-#if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__SSSE3__)
 #include <immintrin.h>
 static inline int hsum_i32_8(const __m256i a) {
     const __m128i sum128 = _mm_add_epi32(_mm256_castsi256_si128(a), _mm256_extractf128_si256(a, 1));

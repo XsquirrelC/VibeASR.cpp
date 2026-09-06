@@ -49,8 +49,8 @@ To enable efficient edge CPU deployment, we replace the original Qwen2.5-7B lang
 
 | | 1T | 2T | 3T | 4T | 6T | 8T |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| RTF | 1.98 | 1.08 | **0.77** | **0.63** | **0.49** | **0.42** |
-| vs. Whisper.cpp | 2.28× | 2.12× | 1.86× | 1.86× | 1.71× | 1.55× |
+| RTF | 1.52 | **0.81** | **0.57** | **0.45** | **0.32** | **0.27** |
+| vs. Whisper.cpp | 2.73× | 2.72× | 2.62× | 2.61× | 2.45× | 2.26× |
 
 **Apple M4 (ARM NEON, 4P+6E, 16GB)**
 
@@ -66,7 +66,7 @@ To enable efficient edge CPU deployment, we replace the original Qwen2.5-7B lang
 
 </div>
 
-> RTF (Real-Time Factor) on audio input. **Bold** = RTF < 1 (real-time). EPYC/M4 use 20s audio; i7-13700 uses a 10.3s clip.
+> RTF (Real-Time Factor) on audio input, excluding one-time model loading. **Bold** = RTF < 1 (real-time). All measurements use audio clips in the 10s–30s range; the Whisper.cpp comparison (large-v3-turbo) runs the exact same clip through both engines with greedy decoding.
 
 ### Accuracy (WER%)
 

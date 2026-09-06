@@ -379,7 +379,6 @@ static bool load_encoder_weights(
         // Read kernel size from weight tensor shape [out_channels, in_channels, kernel_size]
         // In GGUF, dimensions are reversed, so ne[0] is kernel_size
         encoder.downsample_kernel_sizes[i] = encoder.downsamples[i].conv_weight->ne[0];
-        fprintf(stderr, "[VAE]   Downsample %d kernel size: %d\n", i, encoder.downsample_kernel_sizes[i]);
     }
     
     // Load stages
@@ -439,7 +438,6 @@ static bool load_encoder_weights(
             // Store kernel size at stage level (use first block's kernel size)
             if (block == 0) {
                 encoder.stage_kernel_sizes[stage] = b.kernel_size;
-                fprintf(stderr, "[VAE]   Stage %d kernel size: %d\n", stage, encoder.stage_kernel_sizes[stage]);
             }
         }
     }
@@ -482,9 +480,6 @@ static bool load_encoder_weights(
     // Get connector output dim from fc2 weight [input_dim, output_dim]
     encoder.connector_output_dim = encoder.connector_fc2_weight->ne[1];
     
-    fprintf(stderr, "[VAE] Loaded encoder '%s': vae_output_dim=%d, connector_output_dim=%d\n", 
-            prefix.c_str(), encoder.output_dim, encoder.connector_output_dim);
-    
     return true;
 }
 
@@ -508,8 +503,6 @@ struct vae_context_params vae_context_default_params() {
 vae_model_t* vae_load_model_from_file(
     const char* model_path,
     struct vae_model_params params) {
-    
-    fprintf(stderr, "[VAE] Loading model from %s\n", model_path);
     
     auto model = new vae_model();
     
@@ -536,8 +529,7 @@ vae_model_t* vae_load_model_from_file(
     
     // Read metadata
     int n_tensors = gguf_get_n_tensors(gguf_ctx);
-    fprintf(stderr, "[VAE] Model contains %d tensors\n", n_tensors);
-    
+
     // Map tensors by name
     for (int i = 0; i < n_tensors; i++) {
         const char* name = gguf_get_tensor_name(gguf_ctx, i);
@@ -589,9 +581,6 @@ vae_model_t* vae_load_model_from_file(
     model->acoustic_dim = model->acoustic_encoder.connector_output_dim;
     model->semantic_dim = model->semantic_encoder.connector_output_dim;
     
-    fprintf(stderr, "[VAE] Model loaded successfully\n");
-    fprintf(stderr, "[VAE]   Acoustic output dim (after connector): %d\n", model->acoustic_dim);
-    fprintf(stderr, "[VAE]   Semantic output dim (after connector): %d\n", model->semantic_dim);
     
     return model;
 }
