@@ -46,6 +46,7 @@ poetry.toml
 # Build
 build/
 build_debug/
+build_streaming/
 logs/
 
 # Eval
