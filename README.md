@@ -56,7 +56,7 @@ To enable efficient edge CPU deployment, we replace the original Qwen2.5-7B lang
 
 | | 1T | 2T | 3T | 4T | 6T | 8T |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| RTF | 1.18 | **0.68** | **0.52** | **0.43** | **0.48** | **0.42** |
+| RTF | **0.67** | **0.38** | **0.27** | **0.22** | **0.24** | **0.21** |
 
 **Intel Core i7-13700 (AVX2+FMA, 8P+8E, 32GB, Windows 11 / MinGW GCC)**
 

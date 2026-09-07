@@ -97,52 +97,60 @@ void ggml_vec_dot_i8_i8_1x1(int n, int32_t * s, size_t bs, const void * vx, size
         for (int i = 0; i < group32_num; i++) {
             const int8_t * px = x_row + i * 32 * QK_I8_S;
             const int8_t * py = y + i * 32 * QK_I8_S;
+            // Blocks are contiguous, so a 16-byte load spans two of them and a
+            // group of 32 blocks is exactly 16 full q-registers -- no odd tail.
 #if defined(__ARM_FEATURE_DOTPROD)
-            for (int j = 0; j < 32; j++) {
-                int8x8_t xv = vld1_s8(px);
-                int8x8_t yv = vld1_s8(py);
-                int32x2_t d = vdot_s32(vdup_n_s32(0), xv, yv);
-                accu = vcombine_s32(vadd_s32(vget_low_s32(accu), d), vget_high_s32(accu));
-                px += QK_I8_S;
-                py += QK_I8_S;
+            for (int j = 0; j < 32; j += 2) {
+                // SDOT already accumulates into its destination, so feed the
+                // running accumulator straight in rather than dotting into a
+                // zeroed vector and merging the halves back by hand.
+                accu = vdotq_s32(accu, vld1q_s8(px), vld1q_s8(py));
+                px += 2 * QK_I8_S;
+                py += 2 * QK_I8_S;
             }
 #else
-            int16x8_t accu16 = vdupq_n_s16(0);
-            for (int j = 0; j < 32; j++) {
-                int8x8_t xv = vld1_s8(px);
-                int8x8_t yv = vld1_s8(py);
-                accu16 = vmlal_s8(accu16, xv, yv);
-                px += QK_I8_S;
-                py += QK_I8_S;
+            for (int j = 0; j < 32; j += 2) {
+                const int8x16_t xv = vld1q_s8(px);
+                const int8x16_t yv = vld1q_s8(py);
+                // A single int8*int8 product fits int16 (|p| <= 127*127), but a
+                // running int16 sum over the blocks of a group does not, so
+                // widen every product into the int32 accumulator instead.
+                accu = vpadalq_s16(accu, vmull_s8(vget_low_s8(xv), vget_low_s8(yv)));
+                accu = vpadalq_s16(accu, vmull_high_s8(xv, yv));
+                px += 2 * QK_I8_S;
+                py += 2 * QK_I8_S;
             }
-            accu = vaddq_s32(accu, vmovl_s16(vget_low_s16(accu16)));
-            accu = vaddq_s32(accu, vmovl_high_s16(accu16));
 #endif
         }
 
         for (int i = 0; i < groupla_num; i++) {
             const int8_t * px = x_row + group32_num * 32 * QK_I8_S;
             const int8_t * py = y + group32_num * 32 * QK_I8_S;
+            // la_num may be odd, so the last lone block is handled separately
+            // rather than over-reading past the end of the row.
+            int j = 0;
 #if defined(__ARM_FEATURE_DOTPROD)
-            for (int j = 0; j < la_num; j++) {
-                int8x8_t xv = vld1_s8(px);
-                int8x8_t yv = vld1_s8(py);
-                int32x2_t d = vdot_s32(vdup_n_s32(0), xv, yv);
-                accu = vcombine_s32(vadd_s32(vget_low_s32(accu), d), vget_high_s32(accu));
-                px += QK_I8_S;
-                py += QK_I8_S;
+            for (; j + 2 <= la_num; j += 2) {
+                accu = vdotq_s32(accu, vld1q_s8(px), vld1q_s8(py));
+                px += 2 * QK_I8_S;
+                py += 2 * QK_I8_S;
+            }
+            if (j < la_num) {
+                accu = vcombine_s32(vdot_s32(vget_low_s32(accu), vld1_s8(px), vld1_s8(py)),
+                                    vget_high_s32(accu));
             }
 #else
-            int16x8_t accu16la = vdupq_n_s16(0);
-            for (int j = 0; j < la_num; j++) {
-                int8x8_t xv = vld1_s8(px);
-                int8x8_t yv = vld1_s8(py);
-                accu16la = vmlal_s8(accu16la, xv, yv);
-                px += QK_I8_S;
-                py += QK_I8_S;
+            for (; j + 2 <= la_num; j += 2) {
+                const int8x16_t xv = vld1q_s8(px);
+                const int8x16_t yv = vld1q_s8(py);
+                accu = vpadalq_s16(accu, vmull_s8(vget_low_s8(xv), vget_low_s8(yv)));
+                accu = vpadalq_s16(accu, vmull_high_s8(xv, yv));
+                px += 2 * QK_I8_S;
+                py += 2 * QK_I8_S;
             }
-            accu = vaddq_s32(accu, vmovl_s16(vget_low_s16(accu16la)));
-            accu = vaddq_s32(accu, vmovl_high_s16(accu16la));
+            if (j < la_num) {
+                accu = vpadalq_s16(accu, vmull_s8(vld1_s8(px), vld1_s8(py)));
+            }
 #endif
         }
 
@@ -279,35 +287,29 @@ void ggml_vec_dot_i8_i8_1xN(int n, int32_t * s, size_t bs, const void * vx, size
             for (int rb = 0; rb < VAE_PARALLEL_SIZE; rb++) {
                 px[rb] = x_row[rb] + i * 32 * QK_I8_S;
             }
-            for (int j = 0; j < 32; j++) {
-                int8x8_t yv = vld1_s8(py);
+            for (int j = 0; j < 32; j += 2) {
+                const int8x16_t yv = vld1q_s8(py);
                 for (int rb = 0; rb < VAE_PARALLEL_SIZE; rb++) {
-                    int8x8_t xv = vld1_s8(px[rb]);
-                    int32x2_t d = vdot_s32(vdup_n_s32(0), xv, yv);
-                    accu[rb] = vcombine_s32(vadd_s32(vget_low_s32(accu[rb]), d), vget_high_s32(accu[rb]));
-                    px[rb] += QK_I8_S;
+                    accu[rb] = vdotq_s32(accu[rb], vld1q_s8(px[rb]), yv);
+                    px[rb] += 2 * QK_I8_S;
                 }
-                py += QK_I8_S;
+                py += 2 * QK_I8_S;
             }
 #else
-            int16x8_t accu16[VAE_PARALLEL_SIZE];
             const int8_t * px[VAE_PARALLEL_SIZE];
             for (int rb = 0; rb < VAE_PARALLEL_SIZE; rb++) {
-                accu16[rb] = vdupq_n_s16(0);
                 px[rb] = x_row[rb] + i * 32 * QK_I8_S;
             }
-            for (int j = 0; j < 32; j++) {
-                int8x8_t yv = vld1_s8(py);
+            for (int j = 0; j < 32; j += 2) {
+                const int8x16_t yv = vld1q_s8(py);
                 for (int rb = 0; rb < VAE_PARALLEL_SIZE; rb++) {
-                    int8x8_t xv = vld1_s8(px[rb]);
-                    accu16[rb] = vmlal_s8(accu16[rb], xv, yv);
-                    px[rb] += QK_I8_S;
+                    const int8x16_t xv = vld1q_s8(px[rb]);
+                    // int16 holds one product but not a whole group's sum of them.
+                    accu[rb] = vpadalq_s16(accu[rb], vmull_s8(vget_low_s8(xv), vget_low_s8(yv)));
+                    accu[rb] = vpadalq_s16(accu[rb], vmull_high_s8(xv, yv));
+                    px[rb] += 2 * QK_I8_S;
                 }
-                py += QK_I8_S;
-            }
-            for (int rb = 0; rb < VAE_PARALLEL_SIZE; rb++) {
-                accu[rb] = vaddq_s32(accu[rb], vmovl_s16(vget_low_s16(accu16[rb])));
-                accu[rb] = vaddq_s32(accu[rb], vmovl_high_s16(accu16[rb]));
+                py += 2 * QK_I8_S;
             }
 #endif
         }
@@ -319,35 +321,44 @@ void ggml_vec_dot_i8_i8_1xN(int n, int32_t * s, size_t bs, const void * vx, size
             for (int rb = 0; rb < VAE_PARALLEL_SIZE; rb++) {
                 px[rb] = x_row[rb] + group32_num * 32 * QK_I8_S;
             }
-            for (int j = 0; j < la_num; j++) {
-                int8x8_t yv = vld1_s8(py);
+            int j = 0;
+            for (; j + 2 <= la_num; j += 2) {
+                const int8x16_t yv = vld1q_s8(py);
                 for (int rb = 0; rb < VAE_PARALLEL_SIZE; rb++) {
-                    int8x8_t xv = vld1_s8(px[rb]);
-                    int32x2_t d = vdot_s32(vdup_n_s32(0), xv, yv);
-                    accu[rb] = vcombine_s32(vadd_s32(vget_low_s32(accu[rb]), d), vget_high_s32(accu[rb]));
-                    px[rb] += QK_I8_S;
+                    accu[rb] = vdotq_s32(accu[rb], vld1q_s8(px[rb]), yv);
+                    px[rb] += 2 * QK_I8_S;
                 }
-                py += QK_I8_S;
+                py += 2 * QK_I8_S;
+            }
+            if (j < la_num) {
+                const int8x8_t yv = vld1_s8(py);
+                for (int rb = 0; rb < VAE_PARALLEL_SIZE; rb++) {
+                    accu[rb] = vcombine_s32(
+                        vdot_s32(vget_low_s32(accu[rb]), vld1_s8(px[rb]), yv),
+                        vget_high_s32(accu[rb]));
+                }
             }
 #else
-            int16x8_t accu16la[VAE_PARALLEL_SIZE];
             const int8_t * px[VAE_PARALLEL_SIZE];
             for (int rb = 0; rb < VAE_PARALLEL_SIZE; rb++) {
-                accu16la[rb] = vdupq_n_s16(0);
                 px[rb] = x_row[rb] + group32_num * 32 * QK_I8_S;
             }
-            for (int j = 0; j < la_num; j++) {
-                int8x8_t yv = vld1_s8(py);
+            int j = 0;
+            for (; j + 2 <= la_num; j += 2) {
+                const int8x16_t yv = vld1q_s8(py);
                 for (int rb = 0; rb < VAE_PARALLEL_SIZE; rb++) {
-                    int8x8_t xv = vld1_s8(px[rb]);
-                    accu16la[rb] = vmlal_s8(accu16la[rb], xv, yv);
-                    px[rb] += QK_I8_S;
+                    const int8x16_t xv = vld1q_s8(px[rb]);
+                    accu[rb] = vpadalq_s16(accu[rb], vmull_s8(vget_low_s8(xv), vget_low_s8(yv)));
+                    accu[rb] = vpadalq_s16(accu[rb], vmull_high_s8(xv, yv));
+                    px[rb] += 2 * QK_I8_S;
                 }
-                py += QK_I8_S;
+                py += 2 * QK_I8_S;
             }
-            for (int rb = 0; rb < VAE_PARALLEL_SIZE; rb++) {
-                accu[rb] = vaddq_s32(accu[rb], vmovl_s16(vget_low_s16(accu16la[rb])));
-                accu[rb] = vaddq_s32(accu[rb], vmovl_high_s16(accu16la[rb]));
+            if (j < la_num) {
+                const int8x8_t yv = vld1_s8(py);
+                for (int rb = 0; rb < VAE_PARALLEL_SIZE; rb++) {
+                    accu[rb] = vpadalq_s16(accu[rb], vmull_s8(vld1_s8(px[rb]), yv));
+                }
             }
 #endif
         }
@@ -478,66 +489,67 @@ void ggml_vec_dot_i8_i8_Nx1(int n, int32_t * s, size_t bs, const void * vx, size
 
         for (int i = 0; i < group32_num; i++) {
 #if defined(__ARM_FEATURE_DOTPROD)
-            for (int j = 0; j < 32; j++) {
+            for (int j = 0; j < 32; j += 2) {
                 const int8_t * px = x + (i * 32 + j) * QK_I8_S;
-                int8x8_t xv = vld1_s8(px);
+                const int8x16_t xv = vld1q_s8(px);
                 for (int cb = 0; cb < VAE_PARALLEL_SIZE; cb++) {
                     const int8_t * py = y + (col + cb) * by + (i * 32 + j) * QK_I8_S;
-                    int8x8_t yv = vld1_s8(py);
-                    int32x2_t d = vdot_s32(vdup_n_s32(0), xv, yv);
-                    accu[cb] = vcombine_s32(vadd_s32(vget_low_s32(accu[cb]), d), vget_high_s32(accu[cb]));
+                    accu[cb] = vdotq_s32(accu[cb], xv, vld1q_s8(py));
                 }
             }
 #else
-            int16x8_t accu16[VAE_PARALLEL_SIZE];
-            for (int cb = 0; cb < VAE_PARALLEL_SIZE; cb++) {
-                accu16[cb] = vdupq_n_s16(0);
-            }
-            for (int j = 0; j < 32; j++) {
+            for (int j = 0; j < 32; j += 2) {
                 const int8_t * px = x + (i * 32 + j) * QK_I8_S;
-                int8x8_t xv = vld1_s8(px);
+                const int8x16_t xv = vld1q_s8(px);
                 for (int cb = 0; cb < VAE_PARALLEL_SIZE; cb++) {
                     const int8_t * py = y + (col + cb) * by + (i * 32 + j) * QK_I8_S;
-                    int8x8_t yv = vld1_s8(py);
-                    accu16[cb] = vmlal_s8(accu16[cb], xv, yv);
+                    const int8x16_t yv = vld1q_s8(py);
+                    // int16 holds one product but not a whole group's sum of them.
+                    accu[cb] = vpadalq_s16(accu[cb], vmull_s8(vget_low_s8(xv), vget_low_s8(yv)));
+                    accu[cb] = vpadalq_s16(accu[cb], vmull_high_s8(xv, yv));
                 }
-            }
-            for (int cb = 0; cb < VAE_PARALLEL_SIZE; cb++) {
-                accu[cb] = vaddq_s32(accu[cb], vmovl_s16(vget_low_s16(accu16[cb])));
-                accu[cb] = vaddq_s32(accu[cb], vmovl_high_s16(accu16[cb]));
             }
 #endif
         }
 
         for (int i = 0; i < groupla_num; i++) {
 #if defined(__ARM_FEATURE_DOTPROD)
-            for (int j = 0; j < la_num; j++) {
+            int j = 0;
+            for (; j + 2 <= la_num; j += 2) {
                 const int8_t * px = x + (group32_num * 32 + j) * QK_I8_S;
-                int8x8_t xv = vld1_s8(px);
+                const int8x16_t xv = vld1q_s8(px);
                 for (int cb = 0; cb < VAE_PARALLEL_SIZE; cb++) {
                     const int8_t * py = y + (col + cb) * by + (group32_num * 32 + j) * QK_I8_S;
-                    int8x8_t yv = vld1_s8(py);
-                    int32x2_t d = vdot_s32(vdup_n_s32(0), xv, yv);
-                    accu[cb] = vcombine_s32(vadd_s32(vget_low_s32(accu[cb]), d), vget_high_s32(accu[cb]));
+                    accu[cb] = vdotq_s32(accu[cb], xv, vld1q_s8(py));
+                }
+            }
+            if (j < la_num) {
+                const int8x8_t xv = vld1_s8(x + (group32_num * 32 + j) * QK_I8_S);
+                for (int cb = 0; cb < VAE_PARALLEL_SIZE; cb++) {
+                    const int8_t * py = y + (col + cb) * by + (group32_num * 32 + j) * QK_I8_S;
+                    accu[cb] = vcombine_s32(
+                        vdot_s32(vget_low_s32(accu[cb]), xv, vld1_s8(py)),
+                        vget_high_s32(accu[cb]));
                 }
             }
 #else
-            int16x8_t accu16la[VAE_PARALLEL_SIZE];
-            for (int cb = 0; cb < VAE_PARALLEL_SIZE; cb++) {
-                accu16la[cb] = vdupq_n_s16(0);
-            }
-            for (int j = 0; j < la_num; j++) {
+            int j = 0;
+            for (; j + 2 <= la_num; j += 2) {
                 const int8_t * px = x + (group32_num * 32 + j) * QK_I8_S;
-                int8x8_t xv = vld1_s8(px);
+                const int8x16_t xv = vld1q_s8(px);
                 for (int cb = 0; cb < VAE_PARALLEL_SIZE; cb++) {
                     const int8_t * py = y + (col + cb) * by + (group32_num * 32 + j) * QK_I8_S;
-                    int8x8_t yv = vld1_s8(py);
-                    accu16la[cb] = vmlal_s8(accu16la[cb], xv, yv);
+                    const int8x16_t yv = vld1q_s8(py);
+                    accu[cb] = vpadalq_s16(accu[cb], vmull_s8(vget_low_s8(xv), vget_low_s8(yv)));
+                    accu[cb] = vpadalq_s16(accu[cb], vmull_high_s8(xv, yv));
                 }
             }
-            for (int cb = 0; cb < VAE_PARALLEL_SIZE; cb++) {
-                accu[cb] = vaddq_s32(accu[cb], vmovl_s16(vget_low_s16(accu16la[cb])));
-                accu[cb] = vaddq_s32(accu[cb], vmovl_high_s16(accu16la[cb]));
+            if (j < la_num) {
+                const int8x8_t xv = vld1_s8(x + (group32_num * 32 + j) * QK_I8_S);
+                for (int cb = 0; cb < VAE_PARALLEL_SIZE; cb++) {
+                    const int8_t * py = y + (col + cb) * by + (group32_num * 32 + j) * QK_I8_S;
+                    accu[cb] = vpadalq_s16(accu[cb], vmull_s8(xv, vld1_s8(py)));
+                }
             }
 #endif
         }
