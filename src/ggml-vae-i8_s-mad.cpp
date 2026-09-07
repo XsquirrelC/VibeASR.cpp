@@ -8,7 +8,7 @@
 #include "lm-config.h"
 #include "vae-config.h"
 
-// Every vector path below is AVX2: madd_epi16, cvtepi8_epi16, hadd_epi32 and
+// Every vector path below is AVX2: madd_epi16, maddubs_epi16, hadd_epi32 and
 // permutevar8x32_epi32 all need it, so a plain -mavx build takes the scalar path.
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -20,16 +20,23 @@ static inline int hsum_i32_8(const __m256i a) {
     return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
 }
 
-// Pairwise int8 products of two 32-byte vectors, widened to int32: lane k of
-// *pl is qx[2k]*qy[2k] + qx[2k+1]*qy[2k+1] over the low 16 bytes, *ph the same
-// over the high 16. The widening is what keeps the full [-128,127] domain
-// exact: a single product reaches 16384 and a pair 32768, so an int16 result
-// would saturate.
+// Pairwise int8 products of one 32-byte block, as int16: lane k is
+// qx[2k]*qy[2k] + qx[2k+1]*qy[2k+1]. Requires |qx|, |qy| <= 127, which the I8_S
+// quantizers guarantee (s = 127/absmax, clamped), so a pair stays under 32258
+// and maddubs cannot saturate. Callers must widen each block to int32 before
+// accumulating -- carrying these int16 lanes across blocks is what overflows.
+static inline __m256i ggml_i8_s_maddubs(const __m256i qx, const __m256i qy) {
+    const __m256i ax = _mm256_sign_epi8(qx, qx);   // |qx|, fits in a u8 lane
+    const __m256i sy = _mm256_sign_epi8(qy, qx);   // qy * sign(qx)
+    return _mm256_maddubs_epi16(ax, sy);
+}
+
+// Same pairwise products, widened to int32: lane k of *pl covers the low 16
+// bytes, *ph the high 16.
 static inline void ggml_i8_s_madd_pairs(const __m256i qx, const __m256i qy, __m256i * pl, __m256i * ph) {
-    *pl = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(qx)),
-                            _mm256_cvtepi8_epi16(_mm256_castsi256_si128(qy)));
-    *ph = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_extracti128_si256(qx, 1)),
-                            _mm256_cvtepi8_epi16(_mm256_extracti128_si256(qy, 1)));
+    const __m256i dot = ggml_i8_s_maddubs(qx, qy);
+    *pl = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(dot));
+    *ph = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(dot, 1));
 }
 
 // Eight 4-byte dot products: lane j is the dot product of bytes 4j..4j+3.
@@ -37,11 +44,8 @@ static inline __m256i ggml_i8_s_dot4(const __m256i qx, const __m256i qy) {
 #if defined(__AVXVNNIINT8__)
     return _mm256_dpbssd_epi32(_mm256_setzero_si256(), qx, qy);
 #else
-    __m256i pl, ph;
-    ggml_i8_s_madd_pairs(qx, qy, &pl, &ph);
-    // hadd interleaves the two 128-bit halves, the permute restores byte order.
-    return _mm256_permutevar8x32_epi32(_mm256_hadd_epi32(pl, ph),
-                                       _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7));
+    // madd_epi16 folds adjacent int16 pairs in place, so lane order is preserved.
+    return _mm256_madd_epi16(ggml_i8_s_maddubs(qx, qy), _mm256_set1_epi16(1));
 #endif
 }
 
@@ -53,14 +57,14 @@ static inline __m128i ggml_i8_s_dot8(const __m256i qx, const __m256i qy) {
 }
 
 // Fold one 32-byte block into an int32 accumulator that the caller finishes
-// with hsum_i32_8.
+// with hsum_i32_8. Widening every block is what keeps this exact -- the int16
+// lanes are never carried across blocks.
 static inline __m256i ggml_i8_s_acc32(const __m256i accu, const __m256i qx, const __m256i qy) {
 #if defined(__AVXVNNIINT8__)
     return _mm256_dpbssd_epi32(accu, qx, qy);
 #else
-    __m256i pl, ph;
-    ggml_i8_s_madd_pairs(qx, qy, &pl, &ph);
-    return _mm256_add_epi32(accu, _mm256_add_epi32(pl, ph));
+    return _mm256_add_epi32(accu,
+        _mm256_madd_epi16(ggml_i8_s_maddubs(qx, qy), _mm256_set1_epi16(1)));
 #endif
 }
 #endif
