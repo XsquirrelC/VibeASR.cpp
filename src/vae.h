@@ -109,10 +109,12 @@ int32_t vae_encode_semantic_with_timing(
 // The encoder is causal (every conv pads left-only), so audio can be fed one
 // chunk at a time. Each conv keeps its own left context, which makes a chunk
 // cost exactly its own frames instead of its frames plus the 67.6-frame
-// receptive field. Cost: ~737 KiB per encoder.
+// receptive field. Cost: ~737 KiB per encoder for F32, ~184 KiB for I8_S.
 //
-// Currently F32 only; see vae_stream_encode_one for why the I8_S path needs a
-// requantizing concat first.
+// F32 reproduces batch encoding bit-exactly. I8_S cannot: every I8_S op
+// requantizes with a per-tensor dynamic absmax, so a chunk and a whole utterance
+// pick different scales. Measured against the F32 encoder, streaming I8_S is as
+// close to it as batch I8_S is (see demo/test_stream_encode.cpp).
 
 // Create streaming state. The model must outlive it.
 vae_stream_t* vae_stream_init(
@@ -125,8 +127,40 @@ void vae_stream_free(vae_stream_t* s);
 // Drop all history, as if starting a new utterance
 void vae_stream_reset(vae_stream_t* s);
 
-// Total bytes held in the per-layer caches (0 before the first encode)
+// Total bytes held in the per-layer conv caches (0 before the first encode)
 size_t vae_stream_cache_bytes(const vae_stream_t* s);
+
+//
+// Lookahead embedding cache
+//
+// Training interleaves [X_k][Y_k] where audio window X_k covers latent frames
+// [k*C, k*C + C + L): the text boundary advances by C frames, but the audio
+// window carries L extra lookahead frames, so consecutive windows overlap by L.
+// Re-encoding that overlap would cost (C+L)/C of the encoder every round - and
+// the conv cache above only moves forward, so rewinding L frames is not even
+// possible. Instead the last L frames of latents are retained and prepended to
+// the next window, so exactly C new frames are encoded per round.
+
+// Set the lookahead in frames (default 0 = disabled). Drops any retained frames.
+void vae_stream_set_lookahead(vae_stream_t* s, int32_t n_frames);
+
+// Bytes held in the lookahead embedding cache
+size_t vae_stream_lookahead_bytes(const vae_stream_t* s);
+
+// Encode the next round and emit the whole block the model consumes: the L
+// frames retained from the previous round, followed by the frames just encoded.
+// The first round after init/reset has nothing retained, so feed it C + L frames
+// of audio; every later round feeds C. n_samples must be a multiple of
+// VAE_STREAM_COMPRESS_RATIO.
+// out_* must hold L + n_samples/VAE_STREAM_COMPRESS_RATIO frames.
+// Returns frames written, or -1 on error.
+int32_t vae_stream_encode_block(
+    vae_stream_t* s,
+    const float* audio,
+    int32_t n_samples,
+    float* out_acoustic,
+    float* out_semantic,
+    float* inference_time_ms);
 
 // Encode the next chunk, continuing from the cached left context.
 // n_samples must be a multiple of VAE_STREAM_COMPRESS_RATIO.

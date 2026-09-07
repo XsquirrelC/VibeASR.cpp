@@ -176,37 +176,43 @@ static struct ggml_tensor* ggml_nn_layer_scale(
 // context instead makes a chunk cost exactly its own frames, at 737 KiB per
 // encoder.
 //
-// A slot holds the last n_ctx time steps of one conv's input, as f32, laid out
-// [n_ctx, dim] - the same time-major layout the conv sees. n_ctx is the causal
-// pad that slot replaces: kernel - stride for the strided downsamples,
-// kernel - 1 for the depthwise mixers and the head conv.
+// A slot holds the last n_ctx time steps of one conv's input, laid out
+// [n_ctx, dim] - the same time-major layout the conv sees - in the same type the
+// activations flow in (F32 or I8_S). n_ctx is the causal pad that slot replaces:
+// kernel - stride for the strided downsamples, kernel - 1 for the depthwise
+// mixers and the head conv. On the I8_S path the slot also remembers the
+// per-tensor scale its bytes were quantized with, since I8_S carries one f32
+// scale per tensor.
 
 struct vae_stream_slot {
     int    n_ctx;
     int    dim;
-    size_t offset;  // into vae_stream_enc::buf, in floats
+    enum ggml_type type;
+    size_t offset;  // into vae_stream_enc::buf, in bytes
+    size_t nbytes;
+    float  scale  = 0.0f;  // I8_S only
+    bool   filled = false;
 };
 
 struct vae_stream_enc {
     std::vector<vae_stream_slot> slots;
-    std::vector<float>           buf;
-    size_t                       n_floats = 0;
+    std::vector<char>            buf;
+    size_t                       n_bytes = 0;
 
     // Per-graph scratch, valid only between one build and its compute.
     int cursor = 0;
-    std::vector<struct ggml_tensor*> cache_in;
-    std::vector<struct ggml_tensor*> cache_out;
+    std::vector<struct ggml_tensor*> ext;
 
     void begin_graph() {
         cursor = 0;
-        cache_in.clear();
-        cache_out.clear();
+        ext.clear();
     }
 };
 
 // Replace a conv's causal left pad with that conv's cached left context.
-// Returns the extended input, and records the tail that becomes the next
-// chunk's cache. x must be contiguous and time-major: [L, C].
+// Returns the extended input; the tail that becomes the next chunk's cache is
+// read straight out of it after compute (see vae_stream_roll). x must be
+// contiguous and time-major: [L, C].
 //
 // Output alignment is exact as long as the stride divides L, which holds for
 // every stage whenever the chunk is a whole number of latent frames: with
@@ -219,39 +225,74 @@ static struct ggml_tensor* vae_stream_pad(
     struct ggml_tensor* x,
     int n_ctx) {
 
-    const int64_t L = x->ne[0];
     const int64_t C = x->ne[1];
+    const bool   i8s = (x->type == GGML_TYPE_I8_S);
+    const size_t ts  = i8s ? sizeof(int8_t) : sizeof(float);
 
     const int idx = st->cursor++;
     if ((int) st->slots.size() == idx) {
         // The first graph fixes the geometry; later graphs must agree, or the
         // slots would be read back into the wrong offsets.
-        st->slots.push_back({ n_ctx, (int) C, st->n_floats });
-        st->n_floats += (size_t) n_ctx * C;
+        vae_stream_slot s;
+        s.n_ctx  = n_ctx;
+        s.dim    = (int) C;
+        s.type   = x->type;
+        s.offset = st->n_bytes;
+        s.nbytes = (size_t) n_ctx * C * ts;
+        st->slots.push_back(s);
+        st->n_bytes += s.nbytes;
     } else {
         GGML_ASSERT(st->slots[idx].n_ctx == n_ctx);
         GGML_ASSERT(st->slots[idx].dim   == (int) C);
+        GGML_ASSERT(st->slots[idx].type  == x->type);
     }
     const vae_stream_slot& slot = st->slots[idx];
 
-    struct ggml_tensor* cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ctx, C);
-    const size_t n = (size_t) n_ctx * C;
-    if (st->buf.size() >= slot.offset + n) {
-        memcpy(cache->data, st->buf.data() + slot.offset, n * sizeof(float));
+    struct ggml_tensor* cache = ggml_new_tensor_2d(ctx, x->type, n_ctx, C);
+    if (slot.filled) {
+        memcpy(cache->data, st->buf.data() + slot.offset, slot.nbytes);
     } else {
         // First chunk: zero history, which is exactly the zero pad batch mode
         // would have inserted.
-        memset(cache->data, 0, n * sizeof(float));
+        memset(cache->data, 0, slot.nbytes);
     }
-    st->cache_in.push_back(cache);
+    if (i8s) {
+        // An unfilled slot is all zeros, and scale 0 is how I8_S encodes that.
+        *(float*)((char*) cache->data + (size_t) n_ctx * C) = slot.filled ? slot.scale : 0.0f;
+    }
 
-    struct ggml_tensor* ext = ggml_concat(ctx, cache, x, /*dim =*/ 0);
+    struct ggml_tensor* ext = i8s
+        ? ggml_i8_s_concat(ctx, cache, x)
+        : ggml_concat(ctx, cache, x, /*dim =*/ 0);
 
-    // cont so the tail is contiguous and can be memcpy'd straight back out.
-    st->cache_out.push_back(ggml_cont(ctx,
-        ggml_view_2d(ctx, ext, n_ctx, C, ext->nb[1], (size_t) L * ext->nb[0])));
+    st->ext.push_back(ext);
 
     return ext;
+}
+
+// Copy each conv's new left context out of the computed graph. Must run after
+// ggml_graph_compute and before the compute context is reset.
+static void vae_stream_roll(vae_stream_enc* st) {
+    GGML_ASSERT(st->ext.size() == st->slots.size());
+
+    for (size_t i = 0; i < st->slots.size(); i++) {
+        vae_stream_slot&    slot = st->slots[i];
+        struct ggml_tensor* ext  = st->ext[i];
+
+        const int64_t total = ext->ne[0];          // n_ctx + this chunk's L
+        const size_t  ts    = (slot.type == GGML_TYPE_I8_S) ? sizeof(int8_t) : sizeof(float);
+        GGML_ASSERT(total >= slot.n_ctx);
+
+        for (int c = 0; c < slot.dim; c++) {
+            memcpy(st->buf.data() + slot.offset + (size_t) c * slot.n_ctx * ts,
+                   (const char*) ext->data + ((size_t) c * total + (total - slot.n_ctx)) * ts,
+                   (size_t) slot.n_ctx * ts);
+        }
+        if (slot.type == GGML_TYPE_I8_S) {
+            slot.scale = *(const float*)((const char*) ext->data + (size_t) total * slot.dim);
+        }
+        slot.filled = true;
+    }
 }
 
 //
@@ -911,6 +952,13 @@ struct vae_stream {
     vae_stream_enc acoustic;
     vae_stream_enc semantic;
 
+    // Lookahead embedding cache: the last `lookahead` output frames, kept so the
+    // next block can re-emit them instead of re-encoding their audio.
+    int                lookahead = 0;
+    int                la_valid  = 0;
+    std::vector<float> la_acoustic;
+    std::vector<float> la_semantic;
+
     int64_t n_samples_seen = 0;
 
     struct ggml_context* compute_ctx = nullptr;
@@ -936,18 +984,11 @@ static int32_t vae_stream_encode_one(
         clock_gettime(CLOCK_MONOTONIC, &start_time);
     }
 
-    // The cache is stored as f32 and concatenated in f32. Doing the same on the
-    // I8_S path would need the concat to requantize, since the cached rows carry
-    // the previous chunk's activation scale while the new rows carry this one's
-    // (the scale is a per-tensor dynamic absmax). Until that op exists, refuse
-    // rather than emit wrong latents.
-    if (encoder.downsamples[0].conv_weight->type == GGML_TYPE_I8_S) {
-        fprintf(stderr, "[VAE] Error: streaming encode is F32-only for now; "
-                        "the I8_S path needs a requantizing concat\n");
-        return -1;
-    }
+    const bool use_i8_s = (encoder.downsamples[0].conv_weight->type == GGML_TYPE_I8_S);
 
-    const size_t bytes_per_sample = 65536;
+    // Same rates as the batch path: I8_S intermediates are a quarter the size of
+    // F32 ones, and the graph is otherwise identical.
+    const size_t bytes_per_sample = use_i8_s ? 10240 : 65536;
     const size_t mem_size =
         (size_t) n_samples * bytes_per_sample + (size_t) 512 * 1024 * 1024;
     struct ggml_init_params ctx_params = {
@@ -961,9 +1002,30 @@ static int32_t vae_stream_encode_one(
     }
     s->compute_ctx = ggml_init(ctx_params);
 
-    struct ggml_tensor* input = ggml_new_tensor_3d(s->compute_ctx, GGML_TYPE_F32, n_samples, 1, 1);
-    ggml_set_name(input, "input_audio");
-    memcpy(input->data, audio, (size_t) n_samples * sizeof(float));
+    struct ggml_tensor* input;
+    if (use_i8_s) {
+        input = ggml_new_tensor_3d(s->compute_ctx, GGML_TYPE_I8_S, n_samples, 1, 1);
+        ggml_set_name(input, "input_audio_i8s");
+
+        float amax = 0.00001f;
+        for (int32_t i = 0; i < n_samples; i++) {
+            const float a = fabsf(audio[i]);
+            if (a > amax) amax = a;
+        }
+        const float scale = 127.0f / amax;
+        int8_t* dst_i8 = (int8_t*) input->data;
+        for (int32_t i = 0; i < n_samples; i++) {
+            int v = (int) roundf(audio[i] * scale);
+            if (v >  127) v =  127;
+            if (v < -128) v = -128;
+            dst_i8[i] = (int8_t) v;
+        }
+        *(float*)((char*) input->data + n_samples) = scale;
+    } else {
+        input = ggml_new_tensor_3d(s->compute_ctx, GGML_TYPE_F32, n_samples, 1, 1);
+        ggml_set_name(input, "input_audio");
+        memcpy(input->data, audio, (size_t) n_samples * sizeof(float));
+    }
 
     st.begin_graph();
     struct ggml_tensor* result = encoder.forward(s->compute_ctx, input, &st);
@@ -972,15 +1034,12 @@ static int32_t vae_stream_encode_one(
     // backing buffer now. It stays zero, which is the history the first chunk
     // should see.
     if (st.buf.empty()) {
-        st.buf.assign(st.n_floats, 0.0f);
+        st.buf.assign(st.n_bytes, 0);
     }
 
     size_t max_nodes = vae_model_max_nodes(s->model);
     struct ggml_cgraph* gf = ggml_new_graph_custom(s->compute_ctx, max_nodes, false);
     ggml_build_forward_expand(gf, result);
-    for (struct ggml_tensor* t : st.cache_out) {
-        ggml_build_forward_expand(gf, t);
-    }
 
     if (ggml_graph_compute_with_ctx(s->compute_ctx, gf, s->n_threads) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[VAE] Error: streaming graph computation failed\n");
@@ -996,15 +1055,19 @@ static int32_t vae_stream_encode_one(
 
     const int64_t n_frames = result->ne[1];
     const int64_t out_dim  = result->ne[0];
-    memcpy(output, result->data, (size_t) n_frames * out_dim * result->ne[2] * sizeof(float));
+    const int64_t n_total  = n_frames * out_dim * result->ne[2];
+    if (result->type == GGML_TYPE_I8_S) {
+        const int8_t* src_i8 = (const int8_t*) result->data;
+        const float   dequant = 1.0f / *(const float*)((const char*) result->data + n_total);
+        for (int64_t i = 0; i < n_total; i++) {
+            output[i] = (float) src_i8[i] * dequant;
+        }
+    } else {
+        memcpy(output, result->data, (size_t) n_total * sizeof(float));
+    }
 
     // Roll the caches forward for the next chunk.
-    GGML_ASSERT(st.cache_out.size() == st.slots.size());
-    for (size_t i = 0; i < st.slots.size(); i++) {
-        const vae_stream_slot& slot = st.slots[i];
-        memcpy(st.buf.data() + slot.offset, st.cache_out[i]->data,
-               (size_t) slot.n_ctx * slot.dim * sizeof(float));
-    }
+    vae_stream_roll(&st);
 
     if (inference_time_ms) {
         clock_gettime(CLOCK_MONOTONIC, &end_time);
@@ -1034,16 +1097,39 @@ void vae_stream_reset(vae_stream_t* s) {
     if (!s) {
         return;
     }
-    std::fill(s->acoustic.buf.begin(), s->acoustic.buf.end(), 0.0f);
-    std::fill(s->semantic.buf.begin(), s->semantic.buf.end(), 0.0f);
+    for (vae_stream_enc* st : { &s->acoustic, &s->semantic }) {
+        std::fill(st->buf.begin(), st->buf.end(), 0);
+        for (vae_stream_slot& slot : st->slots) {
+            slot.filled = false;
+            slot.scale  = 0.0f;
+        }
+    }
+    s->la_valid = 0;
     s->n_samples_seen = 0;
+}
+
+void vae_stream_set_lookahead(vae_stream_t* s, int32_t n_frames) {
+    if (!s || n_frames < 0) {
+        return;
+    }
+    s->lookahead = n_frames;
+    s->la_valid  = 0;
+    s->la_acoustic.assign((size_t) n_frames * s->model->acoustic_dim, 0.0f);
+    s->la_semantic.assign((size_t) n_frames * s->model->semantic_dim, 0.0f);
 }
 
 size_t vae_stream_cache_bytes(const vae_stream_t* s) {
     if (!s) {
         return 0;
     }
-    return (s->acoustic.buf.size() + s->semantic.buf.size()) * sizeof(float);
+    return s->acoustic.buf.size() + s->semantic.buf.size();
+}
+
+size_t vae_stream_lookahead_bytes(const vae_stream_t* s) {
+    if (!s) {
+        return 0;
+    }
+    return (s->la_acoustic.size() + s->la_semantic.size()) * sizeof(float);
 }
 
 int32_t vae_stream_encode(
@@ -1088,4 +1174,60 @@ int32_t vae_stream_encode(
         *inference_time_ms = t_a + t_s;
     }
     return n_a >= 0 ? n_a : n_s;
+}
+
+int32_t vae_stream_encode_block(
+    vae_stream_t* s,
+    const float* audio,
+    int32_t n_samples,
+    float* out_acoustic,
+    float* out_semantic,
+    float* inference_time_ms) {
+
+    if (!s || !audio || n_samples <= 0) {
+        return -1;
+    }
+    const int ad = s->model->acoustic_dim;
+    const int sd = s->model->semantic_dim;
+    const int la = s->la_valid;
+
+    // The new frames land after the cached lookahead frames, so the caller sees
+    // one contiguous block in time order.
+    const int32_t n_new = vae_stream_encode(s, audio, n_samples,
+        out_acoustic ? out_acoustic + (size_t) la * ad : nullptr,
+        out_semantic ? out_semantic + (size_t) la * sd : nullptr,
+        inference_time_ms);
+    if (n_new < 0) {
+        return -1;
+    }
+
+    if (out_acoustic && la > 0) {
+        memcpy(out_acoustic, s->la_acoustic.data(), (size_t) la * ad * sizeof(float));
+    }
+    if (out_semantic && la > 0) {
+        memcpy(out_semantic, s->la_semantic.data(), (size_t) la * sd * sizeof(float));
+    }
+
+    const int32_t n_out = la + n_new;
+
+    // Keep this block's trailing lookahead frames for the next round.
+    if (s->lookahead > 0) {
+        if (n_out < s->lookahead) {
+            fprintf(stderr, "[VAE] Error: block of %d frames is shorter than the %d-frame lookahead\n",
+                    n_out, s->lookahead);
+            return -1;
+        }
+        const int off = n_out - s->lookahead;
+        if (out_acoustic) {
+            memcpy(s->la_acoustic.data(), out_acoustic + (size_t) off * ad,
+                   (size_t) s->lookahead * ad * sizeof(float));
+        }
+        if (out_semantic) {
+            memcpy(s->la_semantic.data(), out_semantic + (size_t) off * sd,
+                   (size_t) s->lookahead * sd * sizeof(float));
+        }
+        s->la_valid = s->lookahead;
+    }
+
+    return n_out;
 }
