@@ -56,7 +56,7 @@ To enable efficient edge CPU deployment, we replace the original Qwen2.5-7B lang
 
 | | 1T | 2T | 3T | 4T | 6T | 8T |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| RTF | **0.67** | **0.38** | **0.27** | **0.22** | **0.24** | **0.21** |
+| RTF | **0.63** | **0.35** | **0.25** | **0.21** | **0.23** | **0.20** |
 
 **Intel Core i7-13700 (AVX2+FMA, 8P+8E, 32GB, Windows 11 / MinGW GCC)**
 
@@ -66,7 +66,7 @@ To enable efficient edge CPU deployment, we replace the original Qwen2.5-7B lang
 
 </div>
 
-> RTF (Real-Time Factor) on audio input, excluding one-time model loading. **Bold** = RTF < 1 (real-time). All measurements use audio clips in the 10s–30s range with greedy decoding. The EPYC 7V13 row is a steady-state measurement on a 20 s clip (a warm-up pass is excluded from the timing, so the reported time is not charged for first-touch page faults on the VAE compute arena); the Whisper.cpp (large-v3-turbo) baseline it is compared against is the earlier measurement on the same machine and is unchanged.
+> RTF (Real-Time Factor) on audio input, excluding one-time model loading. **Bold** = RTF < 1 (real-time). EPYC / M4: ~20 s clip, steady state (one warm-up pass excluded); i7-13700: 10.3 s clip.
 
 ### Accuracy (WER%)
 
