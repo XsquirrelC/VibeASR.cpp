@@ -11,7 +11,7 @@
 
 **VibeASR.cpp** is the official inference runtime for **VibeVoice-ASR-BitNet** — enabling real-time multilingual speech recognition on CPU through heterogeneous quantization (I8\_S for VAE + I2\_S for LM).
 
-To enable efficient edge CPU deployment, we replace the original Qwen2.5-7B language model with Qwen2.5-1.5B, achieving only modest accuracy degradation (1–4% absolute WER increase) while reducing the total model size from 4.62 GB to 1.58 GB. Combined with custom SIMD kernels and operator fusion in the ggml framework, VibeVoice-ASR-BitNet achieves **1.6–2.3× faster** inference than Whisper.cpp at comparable model sizes, with real-time capability (RTF < 1) on low-resource CPUs.
+To enable efficient edge CPU deployment, we replace the original Qwen2.5-7B language model with Qwen2.5-1.5B, achieving only modest accuracy degradation (1–4% absolute WER increase) while reducing the total model size from 4.62 GB to 1.58 GB. Combined with custom SIMD kernels and operator fusion in the ggml framework, VibeVoice-ASR-BitNet achieves **1.6–2.7× faster** inference than Whisper.cpp at comparable model sizes, with real-time capability (RTF < 1) on low-resource CPUs.
 
 <p align="center">
   <img src="media/report_overview.png" width="92%"/>
@@ -49,8 +49,8 @@ To enable efficient edge CPU deployment, we replace the original Qwen2.5-7B lang
 
 | | 1T | 2T | 3T | 4T | 6T | 8T |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| RTF | 1.83 | **0.97** | **0.67** | **0.52** | **0.37** | **0.30** |
-| vs. Whisper.cpp | 2.31× | 2.22× | 2.20× | 2.15× | 2.04× | 1.93× |
+| RTF | 1.58 | **0.84** | **0.56** | **0.46** | **0.33** | **0.27** |
+| vs. Whisper.cpp | 2.67× | 2.55× | 2.62× | 2.46× | 2.31× | 2.13× |
 
 **Apple M4 (ARM NEON, 4P+6E, 16GB)**
 
@@ -66,7 +66,7 @@ To enable efficient edge CPU deployment, we replace the original Qwen2.5-7B lang
 
 </div>
 
-> RTF (Real-Time Factor) on audio input, excluding one-time model loading. **Bold** = RTF < 1 (real-time). All measurements use audio clips in the 10s–30s range; the Whisper.cpp comparison (large-v3-turbo) runs the exact same clip through both engines with greedy decoding.
+> RTF (Real-Time Factor) on audio input, excluding one-time model loading. **Bold** = RTF < 1 (real-time). All measurements use audio clips in the 10s–30s range with greedy decoding. The EPYC 7V13 row is a steady-state measurement on a 20 s clip (a warm-up pass is excluded from the timing, so the reported time is not charged for first-touch page faults on the VAE compute arena); the Whisper.cpp (large-v3-turbo) baseline it is compared against is the earlier measurement on the same machine and is unchanged.
 
 ### Accuracy (WER%)
 

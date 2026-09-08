@@ -46,6 +46,8 @@ struct asr_params {
 
     bool greedy         = false;
     bool normalize      = true;
+    bool warmup         = false;   // Run one throwaway encode + prefill before timing
+    bool use_mmap       = true;    // mmap LM weights (off = page them in at load time)
     float temperature   = 0.7f;
     float top_p         = 0.9f;
 };
@@ -68,6 +70,9 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "  --context <text>     Hotwords/context info to improve recognition accuracy\n");
     fprintf(stderr, "  --prompt-format <s>  Prompt format: 'text' (plain text) or 'json' (with keys) (default: text)\n");
     fprintf(stderr, "  --no-normalize       Disable audio normalization\n");
+    fprintf(stderr, "  --warmup             Run one throwaway encode+prefill first, so the reported\n");
+    fprintf(stderr, "                       times are steady-state (benchmarking)\n");
+    fprintf(stderr, "  --no-mmap            Do not mmap LM weights (page-in happens at load time)\n");
     fprintf(stderr, "\nExample:\n");
     fprintf(stderr, "  %s --vae-model models/vibeasr-vae-encoder-i8_s.gguf \\\n", prog);
     fprintf(stderr, "     --lm-model models/vibeasr-lm-i2_s.gguf \\\n");
@@ -108,6 +113,10 @@ static bool parse_args(int argc, char ** argv, asr_params & params) {
             params.prompt_format = argv[++i];
         } else if (arg == "--no-normalize") {
             params.normalize = false;
+        } else if (arg == "--warmup") {
+            params.warmup = true;
+        } else if (arg == "--no-mmap") {
+            params.use_mmap = false;
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             exit(0);
@@ -222,6 +231,7 @@ int main(int argc, char ** argv) {
 
     llama_model_params lm_mparams = llama_model_default_params();
     lm_mparams.n_gpu_layers = 0;  // CPU only
+    lm_mparams.use_mmap     = params.use_mmap;
 #ifdef _WIN32
     lm_mparams.use_mmap = false;  // MinGW/Windows lacks PrefetchVirtualMemory; mmap load fails
 #endif
@@ -262,6 +272,22 @@ int main(int argc, char ** argv) {
 
     int32_t n_samples = (int32_t)audio.samples.size();
     int32_t expected_frames = (n_samples + params.compress_ratio - 1) / params.compress_ratio;
+
+    // Optional warm-up: one throwaway encode of the same input, so the timed run
+    // does not pay for first-touch page faults on the (multi-GB) compute arena.
+    // Warm-up time is excluded from the request time / RTF below.
+    double warmup_time = 0.0;
+    if (params.warmup) {
+        fprintf(stderr, "[Warmup] Throwaway encode...\n");
+        double t_warm = get_time_ms();
+        std::vector<float> tmp_a(expected_frames * acoustic_dim);
+        std::vector<float> tmp_s(expected_frames * semantic_dim);
+        float t_a = 0.0f, t_s = 0.0f;
+        vae_encode_acoustic_with_timing(vae_ctx, audio.samples.data(), n_samples, tmp_a.data(), &t_a);
+        vae_encode_semantic_with_timing(vae_ctx, audio.samples.data(), n_samples, tmp_s.data(), &t_s);
+        warmup_time += get_time_ms() - t_warm;
+        fprintf(stderr, "  Warmup encode: acoustic=%.1fms semantic=%.1fms\n\n", t_a, t_s);
+    }
 
     std::vector<float> acoustic_features(expected_frames * acoustic_dim);
     float acoustic_time_ms = 0.0f;
@@ -325,9 +351,23 @@ int main(int argc, char ** argv) {
         // Step 7: LM Prefill (segmented: token ID + embedding + token ID)
         // ========================================
         fprintf(stderr, "\n[Step 7] LM prefill (segmented)...\n");
-        t0 = get_time_ms();
 
         int n_prompt_tokens = (int)prompt.tokens.size();
+
+        // Warm-up prefill: same graph shape as the timed one, so the timed prefill
+        // does not pay for first-touch faults on the compute buffer / KV cache.
+        if (params.warmup) {
+            double t_warm = get_time_ms();
+            llama_kv_cache_clear(lm_ctx);
+            prompt_builder::prefill_segmented(
+                lm_model, lm_ctx, prompt,
+                acoustic_features.data(), acoustic_dim,
+                semantic_features.data(), semantic_dim,
+                n_frames, params.n_batch);
+            warmup_time += get_time_ms() - t_warm;
+        }
+
+        t0 = get_time_ms();
 
         // Clear KV cache
         llama_kv_cache_clear(lm_ctx);
@@ -470,7 +510,7 @@ int main(int argc, char ** argv) {
         // what a user waits for per request. RTF measures the per-request path
         // only: audio in -> encode -> prefill -> decode.
         double load_time    = vae_load_time + lm_load_time;
-        double request_time = total_time - load_time;
+        double request_time = total_time - load_time - warmup_time;
         double rtf = (request_time / 1000.0) / audio.duration_sec;
 
         // Print timing summary

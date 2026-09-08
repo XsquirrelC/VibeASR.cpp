@@ -343,11 +343,18 @@ struct vae_context {
     int n_threads = 4;
     
     struct ggml_context* compute_ctx = nullptr;
-    
+
+    // Compute arena, owned by us and reused across encode calls. A fresh
+    // multi-GB allocation per call costs more in kernel page-fault handling than
+    // the encode itself, and that cost grows with thread count.
+    void*  compute_buf      = nullptr;
+    size_t compute_buf_size = 0;
+
     ~vae_context() {
         if (compute_ctx) {
             ggml_free(compute_ctx);
         }
+        free(compute_buf);
     }
 };
 
@@ -640,25 +647,38 @@ static int32_t vae_encode_impl(
 
     // Create computation context with sufficient memory.
     // Arena use is linear in the input length, and depends on the weight type:
-    // F32 models need more memory than I8_S due to 4x larger intermediate
-    // tensors. The I8_S rate is measured at ~8.9 KB per input sample (~214 MB
-    // per second of 24 kHz audio), constant across 8 s to 267 s inputs; the F32
-    // rate applies the 4x ratio above.
+    // F32/F16 models need more memory than I8_S because their intermediates stay
+    // in F32. Measured rates (ggml_used_mem / n_samples, constant across 4 s to
+    // 267 s inputs): I8_S 8.9 KB per input sample, F32 54.6 KB, F16 55.1 KB.
+    // F16 is not cheaper than F32 here -- only the weights are half precision.
     // A fixed reservation is wrong in both directions. 128 GB is refused
     // outright by Windows (no overcommit) and by Linux heuristic overcommit on
     // any host whose RAM + swap is smaller, aborting in ggml_aligned_malloc
     // before any audio is processed. A small fixed pool starts everywhere but
     // silently caps input length and then segfaults past it. Size the arena
     // from the actual sample count instead, with ~15% headroom.
-    const size_t bytes_per_sample = use_i8_s ? 10240 : 40960;
+    const size_t bytes_per_sample = use_i8_s ? 10240 : 65536;
     const size_t vae_ctx_mem_size =
         (size_t)n_samples * bytes_per_sample + (size_t)512 * 1024 * 1024;
+    // Grow (never shrink) the reused arena. The pages are first-touched once, by
+    // whichever request needs them; later requests find them already mapped.
+    if (ctx->compute_buf_size < vae_ctx_mem_size) {
+        void * grown = realloc(ctx->compute_buf, vae_ctx_mem_size);
+        if (grown == NULL) {
+            fprintf(stderr, "[VAE] Error: failed to allocate %.2f GB compute arena\n",
+                    vae_ctx_mem_size / 1073741824.0);
+            return -1;
+        }
+        ctx->compute_buf      = grown;
+        ctx->compute_buf_size = vae_ctx_mem_size;
+    }
+
     struct ggml_init_params ctx_params = {
-        /*.mem_size   =*/ vae_ctx_mem_size,
-        /*.mem_buffer =*/ nullptr,
+        /*.mem_size   =*/ ctx->compute_buf_size,
+        /*.mem_buffer =*/ ctx->compute_buf,
         /*.no_alloc   =*/ false,  // Let ggml allocate tensors
     };
-    
+
     if (ctx->compute_ctx) {
         ggml_free(ctx->compute_ctx);
     }
