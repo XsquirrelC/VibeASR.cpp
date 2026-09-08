@@ -128,6 +128,33 @@ set_target_properties(bench_chunk PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# End-to-end streaming ASR: causal VAE encode + LM with cross-chunk KV retention
+add_executable(asr_stream
+    demo/asr_stream.cpp
+    src/vae.cpp
+    src/vae.h
+)
+
+target_include_directories(asr_stream PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/utils
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/llama.cpp/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/llama.cpp/ggml/include
+)
+
+target_link_libraries(asr_stream PRIVATE
+    common
+    llama
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+target_compile_features(asr_stream PRIVATE cxx_std_11)
+
+set_target_properties(asr_stream PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 # Streaming-vs-batch equivalence check for the VAE encoder cache
 add_executable(test_stream_encode
     demo/test_stream_encode.cpp
