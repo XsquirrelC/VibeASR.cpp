@@ -62,11 +62,11 @@ To enable efficient edge CPU deployment, we replace the original Qwen2.5-7B lang
 
 | | 1T | 2T | 3T | 4T | 6T | 8T |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| RTF | **0.94** | **0.60** | **0.51** | **0.46** | **0.45** | **0.49** |
+| RTF | **0.93** | **0.59** | **0.49** | **0.41** | **0.44** | **0.45** |
 
 </div>
 
-> RTF (Real-Time Factor) on audio input, excluding one-time model loading. **Bold** = RTF < 1 (real-time). EPYC / M4: ~20 s clip, steady state (one warm-up pass excluded); i7-13700: 10.3 s clip.
+> RTF (Real-Time Factor) on audio input, excluding one-time model loading. **Bold** = RTF < 1 (real-time). All numbers are measured on a ~20 s clip in steady state (one warm-up pass excluded).
 
 ### Accuracy (WER%)
 
